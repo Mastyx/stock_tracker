@@ -1,5 +1,5 @@
 // main.rs
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use macroquad::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,11 @@ struct StockData {
     symbol: String,
     prices: Vec<f32>,
     timestamps: Vec<DateTime<Utc>>,
+    prices_24h_ago: Vec<f32>,               // NUOVO: prezzi di 24h fa
+    timestamps_24h_ago: Vec<DateTime<Utc>>, // NUOVO: timestamp di 24h fa
     current_price: f32,
     change_percent: f32,
+    change_24h_percent: f32, // NUOVO: variazione rispetto a 24h fa
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +35,7 @@ impl App {
     }
 }
 
-// Funzione per ottenere dati da Yahoo Finance
+// Funzione per ottenere dati attuali
 fn fetch_stock_data(symbol: &str) -> Result<(f32, f32), Box<dyn std::error::Error>> {
     let url = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1m&range=1d",
@@ -64,6 +67,57 @@ fn fetch_stock_data(symbol: &str) -> Result<(f32, f32), Box<dyn std::error::Erro
     Err("Failed to parse stock data".into())
 }
 
+// NUOVA FUNZIONE: Recupera dati storici delle ultime 24 ore
+fn fetch_24h_historical_data(
+    symbol: &str,
+) -> Result<(Vec<f32>, Vec<DateTime<Utc>>), Box<dyn std::error::Error>> {
+    // Recupera dati con intervallo di 5 minuti per le ultime 24 ore
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=5m&range=1d",
+        symbol
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .timeout(Duration::from_secs(10))
+        .send()?;
+
+    let json: serde_json::Value = response.json()?;
+
+    if let Some(result) = json["chart"]["result"][0].as_object() {
+        // Estrai timestamp
+        let timestamps = result["timestamp"].as_array().ok_or("No timestamps")?;
+
+        // Estrai prezzi di chiusura
+        let quotes = result["indicators"]["quote"][0]
+            .as_object()
+            .ok_or("No quotes")?;
+
+        let closes = quotes["close"].as_array().ok_or("No close prices")?;
+
+        let mut prices = Vec::new();
+        let mut times = Vec::new();
+
+        for (i, ts) in timestamps.iter().enumerate() {
+            if let Some(timestamp) = ts.as_i64() {
+                if let Some(price_val) = closes.get(i) {
+                    if let Some(price) = price_val.as_f64() {
+                        let dt = DateTime::from_timestamp(timestamp, 0).unwrap_or(Utc::now());
+                        times.push(dt);
+                        prices.push(price as f32);
+                    }
+                }
+            }
+        }
+
+        return Ok((prices, times));
+    }
+
+    Err("Failed to parse historical data".into())
+}
+
 // Disegna un singolo elemento della lista con checkbox
 fn draw_list_item(
     stock: &StockData,
@@ -86,8 +140,6 @@ fn draw_list_item(
     };
 
     draw_rectangle(x, y, width, height, bg_color);
-
-    // Bordo
     draw_rectangle_lines(x, y, width, height, 1.0, Color::from_rgba(50, 50, 60, 255));
 
     // Checkbox
@@ -95,7 +147,6 @@ fn draw_list_item(
     let checkbox_x = x + 10.0;
     let checkbox_y = y + (height - checkbox_size) / 2.0;
 
-    // Sfondo checkbox
     let checkbox_color = if is_selected {
         Color::from_rgba(50, 100, 200, 255)
     } else {
@@ -117,7 +168,6 @@ fn draw_list_item(
         Color::from_rgba(100, 100, 120, 255),
     );
 
-    // Checkmark
     if is_selected {
         draw_line(
             checkbox_x + 4.0,
@@ -138,21 +188,34 @@ fn draw_list_item(
     }
 
     // Simbolo
-    draw_text(&stock.symbol, x + 45.0, y + 25.0, 20.0, WHITE);
+    draw_text(&stock.symbol, x + 45.0, y + 22.0, 20.0, WHITE);
 
     // Prezzo
     if stock.current_price > 0.0 {
         let price_text = format!("${:.2}", stock.current_price);
-        draw_text(&price_text, x + 45.0, y + 48.0, 16.0, LIGHTGRAY);
+        draw_text(&price_text, x + 45.0, y + 42.0, 16.0, LIGHTGRAY);
 
-        // Variazione percentuale
+        // Variazione giornaliera
         let change_color = if stock.change_percent >= 0.0 {
             Color::from_rgba(0, 200, 100, 255)
         } else {
             Color::from_rgba(220, 50, 50, 255)
         };
         let change_text = format!("{:+.2}%", stock.change_percent);
-        draw_text(&change_text, x + width - 80.0, y + 35.0, 18.0, change_color);
+        draw_text(&change_text, x + 45.0, y + 60.0, 14.0, change_color);
+
+        // NUOVO: Variazione 24h (sotto, in blu se diversa)
+        if stock.change_24h_percent != 0.0 {
+            let change_24h_color = Color::from_rgba(100, 150, 255, 255);
+            let change_24h_text = format!("24h: {:+.2}%", stock.change_24h_percent);
+            draw_text(
+                &change_24h_text,
+                x + width - 90.0,
+                y + 60.0,
+                13.0,
+                change_24h_color,
+            );
+        }
     } else {
         draw_text("Caricamento...", x + 45.0, y + 48.0, 14.0, GRAY);
     }
@@ -171,13 +234,10 @@ fn draw_list_panel(
     height: f32,
     scroll_offset: f32,
 ) -> (Option<String>, f32) {
-    // Sfondo del pannello
     draw_rectangle(x, y, width, height, Color::from_rgba(25, 25, 35, 255));
 
-    // Titolo
     draw_text("TITOLI", x + 10.0, y + 30.0, 24.0, WHITE);
 
-    // Contatore selezioni
     let count_text = format!("Selezionati: {}", selected_symbols.len());
     draw_text(&count_text, x + width - 120.0, y + 30.0, 18.0, LIGHTGRAY);
 
@@ -190,7 +250,7 @@ fn draw_list_panel(
         Color::from_rgba(50, 50, 60, 255),
     );
 
-    let item_height = 70.0;
+    let item_height = 75.0; // Aumentato per mostrare info 24h
     let item_padding = 5.0;
     let start_y = y + 50.0;
     let mouse_pos = mouse_position();
@@ -198,7 +258,6 @@ fn draw_list_panel(
     let mut clicked_symbol = None;
     let mut new_scroll = scroll_offset;
 
-    // Gestione scroll con mouse wheel
     let (_wheel_x, wheel_y) = mouse_wheel();
     if mouse_pos.0 >= x && mouse_pos.0 <= x + width && mouse_pos.1 >= y && mouse_pos.1 <= y + height
     {
@@ -206,7 +265,6 @@ fn draw_list_panel(
         new_scroll = new_scroll.max(0.0);
     }
 
-    // Calcola area visibile
     let visible_area_y = start_y;
     let visible_area_height = height - 50.0;
 
@@ -214,7 +272,6 @@ fn draw_list_panel(
         if let Some(stock) = stocks_snapshot.get(symbol) {
             let item_y = visible_area_y + (i as f32) * (item_height + item_padding) - new_scroll;
 
-            // Disegna solo se visibile
             if item_y + item_height >= visible_area_y
                 && item_y <= visible_area_y + visible_area_height
             {
@@ -238,9 +295,8 @@ fn draw_list_panel(
     (clicked_symbol, new_scroll)
 }
 
-// Disegna un mini-grafico per la vista multipla
+// NUOVO: Disegna mini-grafico con confronto 24h
 fn draw_mini_chart(stock: &StockData, x: f32, y: f32, width: f32, height: f32) {
-    // Sfondo
     draw_rectangle(x, y, width, height, Color::from_rgba(30, 30, 40, 255));
     draw_rectangle_lines(x, y, width, height, 2.0, Color::from_rgba(50, 50, 60, 255));
 
@@ -256,7 +312,19 @@ fn draw_mini_chart(stock: &StockData, x: f32, y: f32, width: f32, height: f32) {
         Color::from_rgba(220, 50, 50, 255)
     };
     let change_text = format!("{:+.2}%", stock.change_percent);
-    draw_text(&change_text, x + width - 80.0, y + 40.0, 20.0, change_color);
+    draw_text(&change_text, x + width - 90.0, y + 32.0, 20.0, change_color);
+
+    // NUOVO: Mostra anche variazione 24h
+    if stock.change_24h_percent != 0.0 {
+        let change_24h_text = format!("24h: {:+.2}%", stock.change_24h_percent);
+        draw_text(
+            &change_24h_text,
+            x + width - 90.0,
+            y + 52.0,
+            16.0,
+            Color::from_rgba(100, 150, 255, 255),
+        );
+    }
 
     if stock.prices.len() < 2 {
         draw_text(
@@ -271,31 +339,48 @@ fn draw_mini_chart(stock: &StockData, x: f32, y: f32, width: f32, height: f32) {
 
     // Area del grafico
     let chart_x = x + 20.0;
-    let chart_y = y + 70.0;
+    let chart_y = y + 75.0;
     let chart_width = width - 40.0;
-    let chart_height = height - 100.0;
+    let chart_height = height - 105.0;
 
-    // Trova min e max
-    let min_price = stock.prices.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_price = stock
-        .prices
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    // Trova min e max considerando ENTRAMBE le serie di dati
+    let mut all_prices = stock.prices.clone();
+    all_prices.extend(stock.prices_24h_ago.clone());
+
+    let min_price = all_prices.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_price = all_prices.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let price_range = max_price - min_price;
 
     if price_range == 0.0 {
         return;
     }
 
-    // Colore della linea
+    // NUOVO: Disegna prima la linea BLU delle 24h precedenti
+    if stock.prices_24h_ago.len() >= 2 {
+        let blue_color = Color::from_rgba(100, 150, 255, 180);
+
+        for i in 0..stock.prices_24h_ago.len() - 1 {
+            let x1 = chart_x + (i as f32 / (stock.prices_24h_ago.len() - 1) as f32) * chart_width;
+            let y1 = chart_y + chart_height
+                - ((stock.prices_24h_ago[i] - min_price) / price_range) * chart_height;
+
+            let x2 =
+                chart_x + ((i + 1) as f32 / (stock.prices_24h_ago.len() - 1) as f32) * chart_width;
+            let y2 = chart_y + chart_height
+                - ((stock.prices_24h_ago[i + 1] - min_price) / price_range) * chart_height;
+
+            draw_line(x1, y1, x2, y2, 2.0, blue_color);
+        }
+    }
+
+    // Colore della linea corrente
     let line_color = if stock.change_percent >= 0.0 {
         Color::from_rgba(0, 220, 120, 255)
     } else {
         Color::from_rgba(255, 80, 80, 255)
     };
 
-    // Disegna area sotto la linea
+    // Disegna area sotto la linea corrente
     for i in 0..stock.prices.len() - 1 {
         let x1 = chart_x + (i as f32 / (stock.prices.len() - 1) as f32) * chart_width;
         let y1 =
@@ -321,7 +406,7 @@ fn draw_mini_chart(stock: &StockData, x: f32, y: f32, width: f32, height: f32) {
         );
     }
 
-    // Disegna la linea
+    // Disegna la linea corrente (sopra tutto)
     for i in 0..stock.prices.len() - 1 {
         let x1 = chart_x + (i as f32 / (stock.prices.len() - 1) as f32) * chart_width;
         let y1 =
@@ -331,22 +416,25 @@ fn draw_mini_chart(stock: &StockData, x: f32, y: f32, width: f32, height: f32) {
         let y2 = chart_y + chart_height
             - ((stock.prices[i + 1] - min_price) / price_range) * chart_height;
 
-        draw_line(x1, y1, x2, y2, 2.0, line_color);
+        draw_line(x1, y1, x2, y2, 2.5, line_color);
     }
 
-    // Mini stats
+    // Legenda
+    draw_text("Ora", x + 15.0, y + height - 10.0, 12.0, line_color);
+    draw_text(
+        "24h fa",
+        x + 60.0,
+        y + height - 10.0,
+        12.0,
+        Color::from_rgba(100, 150, 255, 255),
+    );
+
+    // Stats
     draw_text(
         &format!("H: ${:.2}", max_price),
-        x + 15.0,
-        y + height - 10.0,
-        14.0,
-        GRAY,
-    );
-    draw_text(
-        &format!("L: ${:.2}", min_price),
         x + width - 80.0,
         y + height - 10.0,
-        14.0,
+        13.0,
         GRAY,
     );
 }
@@ -360,7 +448,6 @@ fn draw_charts_panel(
     width: f32,
     height: f32,
 ) {
-    // Sfondo
     draw_rectangle(x, y, width, height, Color::from_rgba(20, 20, 30, 255));
 
     if selected_symbols.is_empty() {
@@ -374,7 +461,6 @@ fn draw_charts_panel(
         return;
     }
 
-    // Calcola layout in griglia
     let selected_vec: Vec<&String> = selected_symbols.iter().collect();
     let count = selected_vec.len();
 
@@ -448,8 +534,51 @@ fn start_update_worker(
     });
 }
 
+// NUOVO: Thread per aggiornare i dati delle 24h precedenti (ogni 5 minuti)
+fn start_24h_update_worker(stocks: Arc<Mutex<HashMap<String, StockData>>>, symbols: Vec<String>) {
+    thread::spawn(move || {
+        loop {
+            for symbol in &symbols {
+                match fetch_24h_historical_data(symbol) {
+                    Ok((prices, timestamps)) => {
+                        if let Ok(mut stocks_lock) = stocks.lock() {
+                            if let Some(stock) = stocks_lock.get_mut(symbol) {
+                                stock.prices_24h_ago = prices.clone();
+                                stock.timestamps_24h_ago = timestamps;
+
+                                // Calcola variazione 24h
+                                if !prices.is_empty() && stock.current_price > 0.0 {
+                                    let price_24h_ago = prices[0];
+                                    stock.change_24h_percent =
+                                        ((stock.current_price - price_24h_ago) / price_24h_ago)
+                                            * 100.0;
+                                }
+
+                                println!(
+                                    "{}: Aggiornati dati 24h ({} punti)",
+                                    symbol,
+                                    prices.len()
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Errore nel recupero dati 24h per {}: {}", symbol, e);
+                    }
+                }
+            }
+
+            // Aggiorna ogni 5 minuti
+            thread::sleep(Duration::from_secs(300));
+        }
+    });
+}
+
 // Thread per il fetch iniziale
 fn initial_fetch(stocks: Arc<Mutex<HashMap<String, StockData>>>, symbols: Vec<String>) {
+    let stocks_clone = stocks.clone();
+    let symbols_clone = symbols.clone();
+
     thread::spawn(move || {
         for symbol in &symbols {
             match fetch_stock_data(symbol) {
@@ -470,14 +599,42 @@ fn initial_fetch(stocks: Arc<Mutex<HashMap<String, StockData>>>, symbols: Vec<St
             }
         }
     });
+
+    // Carica anche i dati 24h iniziali
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2)); // Aspetta un po' per non sovraccaricare
+
+        for symbol in &symbols_clone {
+            match fetch_24h_historical_data(symbol) {
+                Ok((prices, timestamps)) => {
+                    if let Ok(mut stocks_lock) = stocks_clone.lock() {
+                        if let Some(stock) = stocks_lock.get_mut(symbol) {
+                            stock.prices_24h_ago = prices.clone();
+                            stock.timestamps_24h_ago = timestamps;
+
+                            if !prices.is_empty() && stock.current_price > 0.0 {
+                                let price_24h_ago = prices[0];
+                                stock.change_24h_percent =
+                                    ((stock.current_price - price_24h_ago) / price_24h_ago) * 100.0;
+                            }
+
+                            println!("{}: Caricati dati 24h ({} punti)", symbol, prices.len());
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Errore caricamento 24h per {}: {}", symbol, e);
+                }
+            }
+        }
+    });
 }
 
-#[macroquad::main("Stock Tracker - Multi Selection")]
+#[macroquad::main("Stock Tracker - Multi Selection con 24h")]
 async fn main() {
     let mut app = App::new();
     let mut scroll_offset = 0.0;
 
-    // Lista estesa di titoli ed ETF
     let symbols = vec![
         "SPY".to_string(),
         "QQQ".to_string(),
@@ -500,23 +657,17 @@ async fn main() {
         "MA".to_string(),
         "XOM".to_string(),
         "BTC-USD".to_string(),
-        "ETH-USD".to_string(),   // Ethereum
-        "BNB-USD".to_string(),   // Binance Coin
-        "XRP-USD".to_string(),   // Ripple
-        "ADA-USD".to_string(),   // Cardano
-        "SOL-USD".to_string(),   // Solana
-        "DOGE-USD".to_string(),  // Dogecoin
-        "DOT-USD".to_string(),   // Polkadot
-        "MATIC-USD".to_string(), // Polygon
-        "AVAX-USD".to_string(),  // Avalanche
-        "LINK-USD".to_string(),  // Chainlink
-        "UNI-USD".to_string(),   // Uniswap
-        "LTC-USD".to_string(),   // Litecoin
-        "ATOM-USD".to_string(),  // Cosmos
-        "XLM-USD".to_string(),   // Stellar
+        "ETH-USD".to_string(),
+        "BNB-USD".to_string(),
+        "XRP-USD".to_string(),
+        "ADA-USD".to_string(),
+        "SOL-USD".to_string(),
+        "DOGE-USD".to_string(),
+        "DOT-USD".to_string(),
+        "MATIC-USD".to_string(),
+        "AVAX-USD".to_string(),
     ];
 
-    // Inizializza le strutture dati
     {
         let mut stocks = app.stocks.lock().unwrap();
         for symbol in &symbols {
@@ -526,36 +677,31 @@ async fn main() {
                     symbol: symbol.clone(),
                     prices: Vec::new(),
                     timestamps: Vec::new(),
+                    prices_24h_ago: Vec::new(),
+                    timestamps_24h_ago: Vec::new(),
                     current_price: 0.0,
                     change_percent: 0.0,
+                    change_24h_percent: 0.0,
                 },
             );
         }
     }
 
-    // Avvia fetch iniziale
     initial_fetch(app.stocks.clone(), symbols.clone());
-
-    // Avvia worker per aggiornamenti periodici
     start_update_worker(app.stocks.clone(), app.last_update.clone(), symbols.clone());
+    start_24h_update_worker(app.stocks.clone(), symbols.clone()); // NUOVO worker
 
     loop {
-        if is_key_pressed(KeyCode::Escape) {
-            break;
-        }
         clear_background(Color::from_rgba(20, 20, 30, 255));
 
         let screen_w = screen_width();
         let screen_h = screen_height();
 
-        // Dimensioni pannelli
         let list_width = 320.0;
         let charts_width = screen_w - list_width;
 
-        // Copia i dati per il rendering
         let stocks_snapshot = { app.stocks.lock().unwrap().clone() };
 
-        // Disegna pannello lista a sinistra
         let (clicked, new_scroll) = draw_list_panel(
             &stocks_snapshot,
             &symbols,
@@ -569,7 +715,6 @@ async fn main() {
 
         scroll_offset = new_scroll;
 
-        // Gestisci toggle selezione
         if let Some(clicked_symbol) = clicked {
             if app.selected_symbols.contains(&clicked_symbol) {
                 app.selected_symbols.remove(&clicked_symbol);
@@ -578,7 +723,6 @@ async fn main() {
             }
         }
 
-        // Linea separatrice verticale
         draw_line(
             list_width,
             0.0,
@@ -588,7 +732,6 @@ async fn main() {
             Color::from_rgba(50, 50, 60, 255),
         );
 
-        // Disegna grafici selezionati a destra
         draw_charts_panel(
             &stocks_snapshot,
             &app.selected_symbols,
@@ -598,7 +741,6 @@ async fn main() {
             screen_h,
         );
 
-        // Info ultimo aggiornamento
         let last_update = { *app.last_update.lock().unwrap() };
         let update_text = format!("Aggiornamento: {}", last_update.format("%H:%M:%S"));
         draw_text(&update_text, list_width + 15.0, screen_h - 10.0, 14.0, GRAY);
